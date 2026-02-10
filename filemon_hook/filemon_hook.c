@@ -194,6 +194,13 @@ static NTSTATUS NTAPI NtCreateFile_Hook(
     if (buf[0] != L'\\')
         return status;
 
+    /* Strip \??\ prefix from DOS device paths */
+    if (charLen >= 4 && buf[0] == L'\\' && buf[1] == L'?' &&
+        buf[2] == L'?' && buf[3] == L'\\') {
+        buf += 4;
+        charLen -= 4;
+    }
+
     PathList_Push(buf, charLen);
     return status;
 }
