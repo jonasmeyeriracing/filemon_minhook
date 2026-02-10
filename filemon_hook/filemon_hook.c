@@ -60,6 +60,7 @@ static SRWLOCK             g_pathLock = SRWLOCK_INIT;
 /* Reporter thread */
 static HANDLE g_hReporterThread = NULL;
 static HANDLE g_hStopEvent      = NULL;
+static HANDLE g_hPipeHandle     = INVALID_HANDLE_VALUE;
 
 /* Pipe name (overridden by FILEMON_PIPE env var) */
 static wchar_t g_pipeName[256] = L"\\\\.\\pipe\\filemon";
@@ -244,6 +245,7 @@ static DWORD WINAPI ReporterThreadProc(LPVOID param)
             /* Connected — set to byte mode */
             DWORD mode = PIPE_READMODE_BYTE;
             SetNamedPipeHandleState(hPipe, &mode, NULL, NULL);
+            g_hPipeHandle = hPipe;
             retryDelayMs = 100;
         }
 
@@ -271,6 +273,7 @@ static DWORD WINAPI ReporterThreadProc(LPVOID param)
             PathEntry *next = list->next;
             if (!SendPath(hPipe, list->path)) {
                 /* Pipe broken — requeue remaining entries and reconnect */
+                g_hPipeHandle = INVALID_HANDLE_VALUE;
                 CloseHandle(hPipe);
                 hPipe = INVALID_HANDLE_VALUE;
 
@@ -284,6 +287,7 @@ static DWORD WINAPI ReporterThreadProc(LPVOID param)
         }
     }
 
+    g_hPipeHandle = INVALID_HANDLE_VALUE;
     if (hPipe != INVALID_HANDLE_VALUE)
         CloseHandle(hPipe);
 
@@ -297,7 +301,6 @@ static DWORD WINAPI ReporterThreadProc(LPVOID param)
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
 {
     (void)hModule;
-    (void)reserved;
 
     switch (reason) {
     case DLL_PROCESS_ATTACH: {
@@ -356,28 +359,45 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
     }
 
     case DLL_PROCESS_DETACH: {
-        /* Signal reporter to stop */
-        if (g_hStopEvent)
-            SetEvent(g_hStopEvent);
+        if (reserved != NULL) {
+            /* Process termination: other threads are already dead.
+               Flush remaining paths directly from here. */
+            MH_DisableHook(MH_ALL_HOOKS);
+            MH_Uninitialize();
 
-        /* Wait for reporter thread with timeout */
-        if (g_hReporterThread) {
-            WaitForSingleObject(g_hReporterThread, 3000);
-            CloseHandle(g_hReporterThread);
-            g_hReporterThread = NULL;
+            if (g_hPipeHandle != INVALID_HANDLE_VALUE) {
+                PathEntry *list = PathList_Drain();
+                list = PathList_Reverse(list);
+                while (list) {
+                    PathEntry *next = list->next;
+                    SendPath(g_hPipeHandle, list->path);
+                    HeapFree(GetProcessHeap(), 0, list);
+                    list = next;
+                }
+                CloseHandle(g_hPipeHandle);
+                g_hPipeHandle = INVALID_HANDLE_VALUE;
+            }
+        } else {
+            /* Dynamic unload (FreeLibrary): signal reporter and wait */
+            if (g_hStopEvent)
+                SetEvent(g_hStopEvent);
+
+            if (g_hReporterThread) {
+                WaitForSingleObject(g_hReporterThread, 3000);
+                CloseHandle(g_hReporterThread);
+                g_hReporterThread = NULL;
+            }
+
+            if (g_hStopEvent) {
+                CloseHandle(g_hStopEvent);
+                g_hStopEvent = NULL;
+            }
+
+            MH_DisableHook(MH_ALL_HOOKS);
+            MH_Uninitialize();
+
+            PathList_FreeChain(PathList_Drain());
         }
-
-        if (g_hStopEvent) {
-            CloseHandle(g_hStopEvent);
-            g_hStopEvent = NULL;
-        }
-
-        /* Disable hook and uninitialize MinHook */
-        MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
-
-        /* Free any remaining list entries */
-        PathList_FreeChain(PathList_Drain());
         break;
     }
     }
