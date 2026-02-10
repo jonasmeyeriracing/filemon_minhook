@@ -27,6 +27,9 @@
 #ifndef FILE_READ_DATA
 #define FILE_READ_DATA              0x0001
 #endif
+#ifndef FILE_WRITE_DATA
+#define FILE_WRITE_DATA             0x0002
+#endif
 
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 
@@ -147,15 +150,16 @@ static NTSTATUS NTAPI NtCreateFile_Hook(
         AllocationSize, FileAttributes, ShareAccess, CreateDisposition,
         CreateOptions, EaBuffer, EaLength);
 
-    /* Only record successful opens that read existing files */
+    /* Only record successful opens */
     if (!NT_SUCCESS(status))
         return status;
 
-    if (!(DesiredAccess & (FILE_READ_DATA | GENERIC_READ)))
-        return status;
-
-    if (CreateDisposition != FILE_OPEN && CreateDisposition != FILE_OPEN_IF)
-        return status;
+    {
+        BOOL hasRead  = (DesiredAccess & (FILE_READ_DATA  | GENERIC_READ))  != 0;
+        BOOL hasWrite = (DesiredAccess & (FILE_WRITE_DATA | GENERIC_WRITE)) != 0;
+        if (!hasRead && !hasWrite)
+            return status;
+    }
 
     /* Extract the path */
     if (!ObjectAttributes || !ObjectAttributes->ObjectName ||
@@ -201,7 +205,35 @@ static NTSTATUS NTAPI NtCreateFile_Hook(
         charLen -= 4;
     }
 
-    PathList_Push(buf, charLen);
+    /* Build "R ", "W ", or "RW " prefixed path */
+    {
+        BOOL hasRead  = (DesiredAccess & (FILE_READ_DATA  | GENERIC_READ))  != 0;
+        BOOL hasWrite = (DesiredAccess & (FILE_WRITE_DATA | GENERIC_WRITE)) != 0;
+        const wchar_t *prefix;
+        size_t prefixLen;
+
+        if (hasRead && hasWrite)      { prefix = L"RW "; prefixLen = 3; }
+        else if (hasWrite)            { prefix = L"W ";  prefixLen = 2; }
+        else                          { prefix = L"R ";  prefixLen = 2; }
+
+        {
+            size_t totalLen = prefixLen + charLen;
+            PathEntry *entry = (PathEntry *)HeapAlloc(
+                GetProcessHeap(), 0,
+                offsetof(PathEntry, path) + (totalLen + 1) * sizeof(wchar_t));
+            if (entry) {
+                memcpy(entry->path, prefix, prefixLen * sizeof(wchar_t));
+                memcpy(entry->path + prefixLen, buf, charLen * sizeof(wchar_t));
+                entry->path[totalLen] = L'\0';
+
+                AcquireSRWLockExclusive(&g_pathLock);
+                entry->next = g_pathHead;
+                g_pathHead  = entry;
+                ReleaseSRWLockExclusive(&g_pathLock);
+            }
+        }
+    }
+
     return status;
 }
 
