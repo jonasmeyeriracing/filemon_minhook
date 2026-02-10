@@ -2,7 +2,8 @@
  * filemon_hook.c — NtCreateFile hook DLL
  *
  * Uses MinHook to intercept NtCreateFile, records files opened for reading,
- * and reports them to a controller process via \\.\pipe\filemon.
+ * and reports them via a named pipe (FILEMON_PIPE) or directly to a file
+ * (FILEMON_FILE).
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -64,6 +65,11 @@ static HANDLE g_hPipeHandle     = INVALID_HANDLE_VALUE;
 
 /* Pipe name (overridden by FILEMON_PIPE env var) */
 static wchar_t g_pipeName[256] = L"\\\\.\\pipe\\filemon";
+
+/* File output mode (alternative to pipe, set via FILEMON_FILE env var) */
+static BOOL    g_useFile     = FALSE;
+static HANDLE  g_hFileHandle = INVALID_HANDLE_VALUE;
+static wchar_t g_fileName[MAX_PATH];
 
 /* --------------------------------------------------------------------------
  * Path list operations
@@ -213,17 +219,56 @@ static BOOL SendPath(HANDLE hPipe, const wchar_t *path)
     return TRUE;
 }
 
+static BOOL SendPathToFile(HANDLE hFile, const wchar_t *path)
+{
+    int charLen = (int)wcslen(path);
+    int utf8Len;
+    char *utf8;
+    DWORD written;
+    BOOL ok;
+
+    if (charLen == 0) return TRUE;
+
+    utf8Len = WideCharToMultiByte(CP_UTF8, 0, path, charLen, NULL, 0, NULL, NULL);
+    if (utf8Len <= 0) return TRUE;
+
+    utf8 = (char *)HeapAlloc(GetProcessHeap(), 0, utf8Len + 2);
+    if (!utf8) return FALSE;
+
+    WideCharToMultiByte(CP_UTF8, 0, path, charLen, utf8, utf8Len, NULL, NULL);
+    utf8[utf8Len] = '\n';
+
+    ok = WriteFile(hFile, utf8, utf8Len + 1, &written, NULL);
+    HeapFree(GetProcessHeap(), 0, utf8);
+    return ok;
+}
+
 static DWORD WINAPI ReporterThreadProc(LPVOID param)
 {
     (void)param;
 
-    HANDLE hPipe       = INVALID_HANDLE_VALUE;
+    HANDLE hOutput      = INVALID_HANDLE_VALUE;
     DWORD  retryDelayMs = 100;
 
+    /* In file mode, open the output file up front */
+    if (g_useFile) {
+        hOutput = CreateFileW(
+            g_fileName,
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+        if (hOutput == INVALID_HANDLE_VALUE)
+            return 1;
+        g_hFileHandle = hOutput;
+    }
+
     while (WaitForSingleObject(g_hStopEvent, 0) != WAIT_OBJECT_0) {
-        /* Connect to pipe if not connected */
-        if (hPipe == INVALID_HANDLE_VALUE) {
-            hPipe = CreateFileW(
+        /* Pipe mode: connect if not connected */
+        if (!g_useFile && hOutput == INVALID_HANDLE_VALUE) {
+            hOutput = CreateFileW(
                 g_pipeName,
                 GENERIC_WRITE,
                 0,
@@ -232,8 +277,7 @@ static DWORD WINAPI ReporterThreadProc(LPVOID param)
                 0,
                 NULL);
 
-            if (hPipe == INVALID_HANDLE_VALUE) {
-                /* Pipe not available — wait with backoff */
+            if (hOutput == INVALID_HANDLE_VALUE) {
                 DWORD waitResult = WaitForSingleObject(g_hStopEvent, retryDelayMs);
                 if (waitResult == WAIT_OBJECT_0)
                     break;
@@ -242,54 +286,70 @@ static DWORD WINAPI ReporterThreadProc(LPVOID param)
                 continue;
             }
 
-            /* Connected — set to byte mode */
             DWORD mode = PIPE_READMODE_BYTE;
-            SetNamedPipeHandleState(hPipe, &mode, NULL, NULL);
-            g_hPipeHandle = hPipe;
+            SetNamedPipeHandleState(hOutput, &mode, NULL, NULL);
+            g_hPipeHandle = hOutput;
             retryDelayMs = 100;
         }
 
         /* Wait for stop or poll interval */
-        DWORD waitResult = WaitForSingleObject(g_hStopEvent, 50);
-        if (waitResult == WAIT_OBJECT_0) {
-            /* Drain remaining entries before exiting */
-            PathEntry *list = PathList_Drain();
-            list = PathList_Reverse(list);
-            while (list) {
-                PathEntry *next = list->next;
-                SendPath(hPipe, list->path);
-                HeapFree(GetProcessHeap(), 0, list);
-                list = next;
+        {
+            DWORD waitResult = WaitForSingleObject(g_hStopEvent, 50);
+            if (waitResult == WAIT_OBJECT_0) {
+                /* Drain remaining entries before exiting */
+                PathEntry *list = PathList_Drain();
+                list = PathList_Reverse(list);
+                while (list) {
+                    PathEntry *next = list->next;
+                    if (g_useFile)
+                        SendPathToFile(hOutput, list->path);
+                    else
+                        SendPath(hOutput, list->path);
+                    HeapFree(GetProcessHeap(), 0, list);
+                    list = next;
+                }
+                break;
             }
-            break;
         }
 
         /* Drain and send */
-        PathEntry *list = PathList_Drain();
-        if (!list) continue;
+        {
+            BOOL sendFailed = FALSE;
+            PathEntry *list = PathList_Drain();
+            if (!list) continue;
 
-        list = PathList_Reverse(list);
-        while (list) {
-            PathEntry *next = list->next;
-            if (!SendPath(hPipe, list->path)) {
-                /* Pipe broken — requeue remaining entries and reconnect */
-                g_hPipeHandle = INVALID_HANDLE_VALUE;
-                CloseHandle(hPipe);
-                hPipe = INVALID_HANDLE_VALUE;
-
-                /* Free entries we couldn't send */
+            list = PathList_Reverse(list);
+            while (list) {
+                PathEntry *next = list->next;
+                BOOL ok = g_useFile ? SendPathToFile(hOutput, list->path)
+                                    : SendPath(hOutput, list->path);
+                if (!ok) {
+                    if (g_useFile)
+                        g_hFileHandle = INVALID_HANDLE_VALUE;
+                    else
+                        g_hPipeHandle = INVALID_HANDLE_VALUE;
+                    CloseHandle(hOutput);
+                    hOutput = INVALID_HANDLE_VALUE;
+                    HeapFree(GetProcessHeap(), 0, list);
+                    PathList_FreeChain(next);
+                    sendFailed = TRUE;
+                    break;
+                }
                 HeapFree(GetProcessHeap(), 0, list);
-                PathList_FreeChain(next);
-                break;
+                list = next;
             }
-            HeapFree(GetProcessHeap(), 0, list);
-            list = next;
+            /* File write failure is unrecoverable */
+            if (sendFailed && g_useFile)
+                break;
         }
     }
 
-    g_hPipeHandle = INVALID_HANDLE_VALUE;
-    if (hPipe != INVALID_HANDLE_VALUE)
-        CloseHandle(hPipe);
+    if (g_useFile)
+        g_hFileHandle = INVALID_HANDLE_VALUE;
+    else
+        g_hPipeHandle = INVALID_HANDLE_VALUE;
+    if (hOutput != INVALID_HANDLE_VALUE)
+        CloseHandle(hOutput);
 
     return 0;
 }
@@ -306,12 +366,22 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
     case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(hModule);
 
-        /* Check for custom pipe name from environment */
+        /* Check for output mode from environment:
+         *   FILEMON_PIPE → named pipe (custom name)
+         *   FILEMON_FILE → direct file output
+         *   neither      → default pipe name */
         {
-            wchar_t buf[256];
+            wchar_t buf[MAX_PATH];
             DWORD n = GetEnvironmentVariableW(L"FILEMON_PIPE", buf, 256);
-            if (n > 0 && n < 256)
+            if (n > 0 && n < 256) {
                 memcpy(g_pipeName, buf, (n + 1) * sizeof(wchar_t));
+            } else {
+                n = GetEnvironmentVariableW(L"FILEMON_FILE", buf, MAX_PATH);
+                if (n > 0 && n < MAX_PATH) {
+                    memcpy(g_fileName, buf, (n + 1) * sizeof(wchar_t));
+                    g_useFile = TRUE;
+                }
+            }
         }
 
         /* Resolve NtCreateFile */
@@ -365,17 +435,26 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
             MH_DisableHook(MH_ALL_HOOKS);
             MH_Uninitialize();
 
-            if (g_hPipeHandle != INVALID_HANDLE_VALUE) {
-                PathEntry *list = PathList_Drain();
-                list = PathList_Reverse(list);
-                while (list) {
-                    PathEntry *next = list->next;
-                    SendPath(g_hPipeHandle, list->path);
-                    HeapFree(GetProcessHeap(), 0, list);
-                    list = next;
+            {
+                HANDLE hOutput = g_useFile ? g_hFileHandle : g_hPipeHandle;
+                if (hOutput != INVALID_HANDLE_VALUE) {
+                    PathEntry *list = PathList_Drain();
+                    list = PathList_Reverse(list);
+                    while (list) {
+                        PathEntry *next = list->next;
+                        if (g_useFile)
+                            SendPathToFile(hOutput, list->path);
+                        else
+                            SendPath(hOutput, list->path);
+                        HeapFree(GetProcessHeap(), 0, list);
+                        list = next;
+                    }
+                    CloseHandle(hOutput);
+                    if (g_useFile)
+                        g_hFileHandle = INVALID_HANDLE_VALUE;
+                    else
+                        g_hPipeHandle = INVALID_HANDLE_VALUE;
                 }
-                CloseHandle(g_hPipeHandle);
-                g_hPipeHandle = INVALID_HANDLE_VALUE;
             }
         } else {
             /* Dynamic unload (FreeLibrary): signal reporter and wait */
