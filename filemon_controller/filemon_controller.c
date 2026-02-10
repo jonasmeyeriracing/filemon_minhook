@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 static volatile BOOL g_running = TRUE;
+static wchar_t g_pipeName[256] = L"\\\\.\\pipe\\filemon";
 
 static BOOL WINAPI CtrlHandler(DWORD ctrlType)
 {
@@ -59,6 +60,14 @@ int main(void)
 {
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
+    /* Check for custom pipe name from environment */
+    {
+        wchar_t buf[256];
+        DWORD n = GetEnvironmentVariableW(L"FILEMON_PIPE", buf, 256);
+        if (n > 0 && n < 256)
+            memcpy(g_pipeName, buf, (n + 1) * sizeof(wchar_t));
+    }
+
     /* Set console output to UTF-8 */
     SetConsoleOutputCP(CP_UTF8);
 
@@ -68,7 +77,7 @@ int main(void)
     while (g_running) {
         /* Create the named pipe */
         HANDLE hPipe = CreateNamedPipeW(
-            L"\\\\.\\pipe\\filemon",
+            g_pipeName,
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             1,          /* max instances */

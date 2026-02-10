@@ -61,8 +61,8 @@ static SRWLOCK             g_pathLock = SRWLOCK_INIT;
 static HANDLE g_hReporterThread = NULL;
 static HANDLE g_hStopEvent      = NULL;
 
-/* Pipe name */
-static const wchar_t g_pipeName[] = L"\\\\.\\pipe\\filemon";
+/* Pipe name (overridden by FILEMON_PIPE env var) */
+static wchar_t g_pipeName[256] = L"\\\\.\\pipe\\filemon";
 
 /* --------------------------------------------------------------------------
  * Path list operations
@@ -302,6 +302,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
     switch (reason) {
     case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(hModule);
+
+        /* Check for custom pipe name from environment */
+        {
+            wchar_t buf[256];
+            DWORD n = GetEnvironmentVariableW(L"FILEMON_PIPE", buf, 256);
+            if (n > 0 && n < 256)
+                memcpy(g_pipeName, buf, (n + 1) * sizeof(wchar_t));
+        }
 
         /* Resolve NtCreateFile */
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");

@@ -23,6 +23,7 @@ int main(void)
     wchar_t exeDir[MAX_PATH];
     wchar_t controllerPath[MAX_PATH];
     wchar_t dllPath[MAX_PATH];
+    wchar_t pipeName[256];
     HANDLE hReadPipe, hWritePipe;
     SECURITY_ATTRIBUTES sa;
     STARTUPINFOW si;
@@ -51,6 +52,10 @@ int main(void)
     wcscat_s(controllerPath, MAX_PATH, L"filemon_controller.exe");
     wcscpy_s(dllPath, MAX_PATH, exeDir);
     wcscat_s(dllPath, MAX_PATH, L"filemon_hook.dll");
+
+    /* Generate unique pipe name and publish via environment */
+    swprintf_s(pipeName, 256, L"\\\\.\\pipe\\filemon_%lu", GetCurrentProcessId());
+    SetEnvironmentVariableW(L"FILEMON_PIPE", pipeName);
 
     /* Create anonymous pipe for capturing controller stdout */
     sa.nLength = sizeof(sa);
@@ -82,7 +87,7 @@ int main(void)
     {
         DWORD start = GetTickCount();
         for (;;) {
-            if (WaitNamedPipeW(L"\\\\.\\pipe\\filemon", 500))
+            if (WaitNamedPipeW(pipeName, 500))
                 break;
             if (GetTickCount() - start > 10000)
                 fail("Timed out waiting for named pipe");
