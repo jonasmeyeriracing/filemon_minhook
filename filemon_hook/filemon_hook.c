@@ -170,39 +170,50 @@ static NTSTATUS NTAPI NtCreateFile_Hook(
     const wchar_t *buf = ObjectAttributes->ObjectName->Buffer;
     USHORT byteLen     = ObjectAttributes->ObjectName->Length;
     size_t charLen     = byteLen / sizeof(wchar_t);
+    wchar_t resolvedPath[MAX_PATH];
 
-    /* Skip non-filesystem NT paths:
-     *   \Device\NamedPipe, \Registry, \Device\Afd, etc.
-     * We only want paths that start with \Device\ but not the above,
-     * OR DOS-style paths like \??\C:\...
-     */
-    if (charLen < 4)
+    if (charLen >= 1 && buf[0] == L'\\') {
+        /* Absolute NT path — filter out non-filesystem paths */
+        if (charLen < 4)
+            return status;
+
+        /* Skip named pipes (our own pipe, and others) */
+        if (charLen >= 18 &&
+            _wcsnicmp(buf, L"\\Device\\NamedPipe", 17) == 0)
+            return status;
+
+        /* Skip registry */
+        if (charLen >= 10 &&
+            _wcsnicmp(buf, L"\\Registry\\", 10) == 0)
+            return status;
+
+        /* Skip Afd (sockets) */
+        if (charLen >= 12 &&
+            _wcsnicmp(buf, L"\\Device\\Afd", 11) == 0)
+            return status;
+
+        /* Strip \??\ prefix from DOS device paths */
+        if (buf[1] == L'?' && buf[2] == L'?' && buf[3] == L'\\') {
+            buf += 4;
+            charLen -= 4;
+        }
+    } else if (ObjectAttributes->RootDirectory) {
+        /* Relative path with a root directory handle (e.g. CWD).
+           Resolve the full DOS path via the opened file handle. */
+        DWORD len = GetFinalPathNameByHandleW(
+            *FileHandle, resolvedPath, MAX_PATH, FILE_NAME_NORMALIZED);
+        if (len == 0 || len >= MAX_PATH)
+            return status;
+        buf = resolvedPath;
+        charLen = len;
+        /* GetFinalPathNameByHandleW returns \\?\C:\... — strip \\?\ */
+        if (charLen >= 4 && buf[0] == L'\\' && buf[1] == L'\\' &&
+            buf[2] == L'?' && buf[3] == L'\\') {
+            buf += 4;
+            charLen -= 4;
+        }
+    } else {
         return status;
-
-    /* Skip named pipes (our own pipe, and others) */
-    if (charLen >= 18 &&
-        _wcsnicmp(buf, L"\\Device\\NamedPipe", 17) == 0)
-        return status;
-
-    /* Skip registry */
-    if (charLen >= 10 &&
-        _wcsnicmp(buf, L"\\Registry\\", 10) == 0)
-        return status;
-
-    /* Skip Afd (sockets) */
-    if (charLen >= 12 &&
-        _wcsnicmp(buf, L"\\Device\\Afd", 11) == 0)
-        return status;
-
-    /* Accept \??\ (DOS device paths) and \Device\ filesystem paths */
-    if (buf[0] != L'\\')
-        return status;
-
-    /* Strip \??\ prefix from DOS device paths */
-    if (charLen >= 4 && buf[0] == L'\\' && buf[1] == L'?' &&
-        buf[2] == L'?' && buf[3] == L'\\') {
-        buf += 4;
-        charLen -= 4;
     }
 
     /* Build "R ", "W ", or "RW " prefixed path */

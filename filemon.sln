@@ -11,6 +11,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "filemon_test", "filemon_tes
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "filemon_commandline_run", "filemon_commandline_run\filemon_commandline_run.vcxproj", "{D4E8F2A1-3B5C-4D7E-8A19-2F6C9E1D3B5A}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "file_workload", "file_workload\file_workload.vcxproj", "{A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -33,6 +35,10 @@ Global
 		{D4E8F2A1-3B5C-4D7E-8A19-2F6C9E1D3B5A}.Debug|x64.Build.0 = Debug|x64
 		{D4E8F2A1-3B5C-4D7E-8A19-2F6C9E1D3B5A}.Release|x64.ActiveCfg = Release|x64
 		{D4E8F2A1-3B5C-4D7E-8A19-2F6C9E1D3B5A}.Release|x64.Build.0 = Release|x64
+		{A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D}.Debug|x64.ActiveCfg = Debug|x64
+		{A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D}.Debug|x64.Build.0 = Debug|x64
+		{A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D}.Release|x64.ActiveCfg = Release|x64
+		{A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
