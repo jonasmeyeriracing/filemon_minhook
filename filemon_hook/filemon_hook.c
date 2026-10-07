@@ -170,7 +170,7 @@ static NTSTATUS NTAPI NtCreateFile_Hook(
     const wchar_t *buf = ObjectAttributes->ObjectName->Buffer;
     USHORT byteLen     = ObjectAttributes->ObjectName->Length;
     size_t charLen     = byteLen / sizeof(wchar_t);
-    wchar_t resolvedPath[MAX_PATH];
+    wchar_t resolvedPath[MAX_PATH + 1];
 
     if (charLen >= 1 && buf[0] == L'\\') {
         /* Absolute NT path — filter out non-filesystem paths */
