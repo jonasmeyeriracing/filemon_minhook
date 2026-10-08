@@ -11,6 +11,7 @@
 #include <winternl.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #include "MinHook.h"
 
@@ -288,22 +289,18 @@ static void Record(const wchar_t *prefix, const wchar_t *text)
     ReleaseSRWLockExclusive(&g_pathLock);
 }
 
-static BOOL InjectSelf(HANDLE hProcess)
+/* Same bitness only: LoadLibraryW's address here is valid in the child */
+static BOOL InjectDll(HANDLE hProcess, const wchar_t *dllPath)
 {
-    SIZE_T size = (wcslen(g_dllPath) + 1) * sizeof(wchar_t);
+    SIZE_T size = (wcslen(dllPath) + 1) * sizeof(wchar_t);
     LPVOID remote;
     HANDLE hThread;
     DWORD exitCode = 0;
     BOOL ok = FALSE;
-    BOOL wow64 = FALSE;
-
-    /* a 64-bit DLL cannot go into a 32-bit process */
-    if (IsWow64Process(hProcess, &wow64) && wow64)
-        return FALSE;
 
     remote = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remote) return FALSE;
-    if (WriteProcessMemory(hProcess, remote, g_dllPath, size, NULL)) {
+    if (WriteProcessMemory(hProcess, remote, dllPath, size, NULL)) {
         hThread = CreateRemoteThread(hProcess, NULL, 0,
             (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"),
             remote, 0, NULL);
@@ -315,6 +312,55 @@ static BOOL InjectSelf(HANDLE hProcess)
     }
     VirtualFreeEx(hProcess, remote, 0, MEM_RELEASE);
     return ok;
+}
+
+/* Other bitness: run the launcher of the child's bitness as
+   "filemon_commandline_run[32].exe --inject <pid> <dll>". Started through the
+   original CreateProcessInternalW, so it is not traced itself. */
+static BOOL InjectViaHelper(DWORD pid, BOOL childIs32)
+{
+    wchar_t dir[MAX_PATH], cmd[3 * MAX_PATH];
+    wchar_t *slash;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exitCode = 1;
+
+    wcscpy_s(dir, MAX_PATH, g_dllPath);
+    slash = wcsrchr(dir, L'\\');
+    if (!slash) return FALSE;
+    slash[1] = L'\0';
+    swprintf_s(cmd, 3 * MAX_PATH, L"\"%s%s\" --inject %lu \"%s%s\"",
+               dir, childIs32 ? L"filemon_commandline_run32.exe" : L"filemon_commandline_run.exe", pid,
+               dir, childIs32 ? L"filemon_hook32.dll" : L"filemon_hook.dll");
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!g_pCreateProcessInternalWOriginal(NULL, NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                                           NULL, NULL, &si, &pi, NULL))
+        return FALSE;
+    CloseHandle(pi.hThread);
+    if (WaitForSingleObject(pi.hProcess, 15000) != WAIT_OBJECT_0 ||
+        !GetExitCodeProcess(pi.hProcess, &exitCode))
+        exitCode = 1;
+    CloseHandle(pi.hProcess);
+    return exitCode == 0;
+}
+
+static BOOL InjectChild(PROCESS_INFORMATION *pi)
+{
+    /* on 64-bit Windows, IsWow64Process is TRUE exactly for 32-bit processes */
+    BOOL childIs32 = FALSE;
+#ifdef _WIN64
+    const BOOL selfIs32 = FALSE;
+#else
+    const BOOL selfIs32 = TRUE;
+#endif
+    if (!IsWow64Process(pi->hProcess, &childIs32))
+        return FALSE;
+    if (childIs32 == selfIs32)
+        return InjectDll(pi->hProcess, g_dllPath);
+    return InjectViaHelper(pi->dwProcessId, childIs32);
 }
 
 static BOOL WINAPI CreateProcessInternalW_Hook(
@@ -340,10 +386,10 @@ static BOOL WINAPI CreateProcessInternalW_Hook(
 
     {
         /* "X <image path>" for a traced child, "XU <image path>" for one that is not
-           (32-bit, or the injection failed) */
+           (the injection failed) */
         wchar_t image[MAX_PATH];
         DWORD n = MAX_PATH;
-        BOOL injected = InjectSelf(lpProcessInformation->hProcess);
+        BOOL injected = InjectChild(lpProcessInformation);
         if (QueryFullProcessImageNameW(lpProcessInformation->hProcess, 0, image, &n))
             Record(injected ? L"X " : L"XU ", image);
     }
