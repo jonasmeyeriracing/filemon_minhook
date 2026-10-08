@@ -46,11 +46,28 @@ typedef NTSTATUS (NTAPI *NtCreateFile_t)(
     PVOID              EaBuffer,
     ULONG              EaLength);
 
+/* kernelbase!CreateProcessInternalW: every CreateProcess* variant ends up here */
+typedef BOOL (WINAPI *CreateProcessInternalW_t)(
+    HANDLE                hUserToken,
+    LPCWSTR               lpApplicationName,
+    LPWSTR                lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL                  bInheritHandles,
+    DWORD                 dwCreationFlags,
+    LPVOID                lpEnvironment,
+    LPCWSTR               lpCurrentDirectory,
+    LPSTARTUPINFOW        lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation,
+    PHANDLE               hNewToken);
+
 /* --------------------------------------------------------------------------
  * Globals
  * ----------------------------------------------------------------------- */
 
 static NtCreateFile_t g_pNtCreateFileOriginal = NULL;
+static CreateProcessInternalW_t g_pCreateProcessInternalWOriginal = NULL;
+static wchar_t g_dllPath[MAX_PATH];  /* this DLL, injected into child processes */
 
 /* Singly-linked path list */
 typedef struct PathEntry {
@@ -246,6 +263,94 @@ static NTSTATUS NTAPI NtCreateFile_Hook(
     }
 
     return status;
+}
+
+/* --------------------------------------------------------------------------
+ * Child processes: start them suspended, inject this DLL, then let them run.
+ * The child finds FILEMON_FILE / FILEMON_PIPE in the environment it inherits
+ * (an explicit environment block without them leaves the child untraced).
+ * ----------------------------------------------------------------------- */
+
+static void Record(const wchar_t *prefix, const wchar_t *text)
+{
+    size_t prefixLen = wcslen(prefix), textLen = wcslen(text);
+    PathEntry *entry = (PathEntry *)HeapAlloc(
+        GetProcessHeap(), 0,
+        offsetof(PathEntry, path) + (prefixLen + textLen + 1) * sizeof(wchar_t));
+    if (!entry) return;
+    memcpy(entry->path, prefix, prefixLen * sizeof(wchar_t));
+    memcpy(entry->path + prefixLen, text, textLen * sizeof(wchar_t));
+    entry->path[prefixLen + textLen] = L'\0';
+
+    AcquireSRWLockExclusive(&g_pathLock);
+    entry->next = g_pathHead;
+    g_pathHead  = entry;
+    ReleaseSRWLockExclusive(&g_pathLock);
+}
+
+static BOOL InjectSelf(HANDLE hProcess)
+{
+    SIZE_T size = (wcslen(g_dllPath) + 1) * sizeof(wchar_t);
+    LPVOID remote;
+    HANDLE hThread;
+    DWORD exitCode = 0;
+    BOOL ok = FALSE;
+    BOOL wow64 = FALSE;
+
+    /* a 64-bit DLL cannot go into a 32-bit process */
+    if (IsWow64Process(hProcess, &wow64) && wow64)
+        return FALSE;
+
+    remote = VirtualAllocEx(hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remote) return FALSE;
+    if (WriteProcessMemory(hProcess, remote, g_dllPath, size, NULL)) {
+        hThread = CreateRemoteThread(hProcess, NULL, 0,
+            (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"),
+            remote, 0, NULL);
+        if (hThread) {
+            ok = WaitForSingleObject(hThread, 10000) == WAIT_OBJECT_0
+                 && GetExitCodeThread(hThread, &exitCode) && exitCode != 0;
+            CloseHandle(hThread);
+        }
+    }
+    VirtualFreeEx(hProcess, remote, 0, MEM_RELEASE);
+    return ok;
+}
+
+static BOOL WINAPI CreateProcessInternalW_Hook(
+    HANDLE                hUserToken,
+    LPCWSTR               lpApplicationName,
+    LPWSTR                lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL                  bInheritHandles,
+    DWORD                 dwCreationFlags,
+    LPVOID                lpEnvironment,
+    LPCWSTR               lpCurrentDirectory,
+    LPSTARTUPINFOW        lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation,
+    PHANDLE               hNewToken)
+{
+    BOOL ok = g_pCreateProcessInternalWOriginal(
+        hUserToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes,
+        bInheritHandles, dwCreationFlags | CREATE_SUSPENDED, lpEnvironment, lpCurrentDirectory,
+        lpStartupInfo, lpProcessInformation, hNewToken);
+    if (!ok)
+        return ok;
+
+    {
+        /* "X <image path>" for a traced child, "XU <image path>" for one that is not
+           (32-bit, or the injection failed) */
+        wchar_t image[MAX_PATH];
+        DWORD n = MAX_PATH;
+        BOOL injected = InjectSelf(lpProcessInformation->hProcess);
+        if (QueryFullProcessImageNameW(lpProcessInformation->hProcess, 0, image, &n))
+            Record(injected ? L"X " : L"XU ", image);
+    }
+
+    if (!(dwCreationFlags & CREATE_SUSPENDED))
+        ResumeThread(lpProcessInformation->hThread);
+    return ok;
 }
 
 /* --------------------------------------------------------------------------
@@ -454,8 +559,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
             return FALSE;
         }
 
-        /* Enable hook */
-        if (MH_EnableHook((LPVOID)pNtCreateFile) != MH_OK) {
+        /* Follow child processes (FILEMON_NOCHILDREN=1 turns it off) */
+        if (GetEnvironmentVariableW(L"FILEMON_NOCHILDREN", NULL, 0) == 0 &&
+            GetModuleFileNameW(hModule, g_dllPath, MAX_PATH) > 0) {
+            HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+            LPVOID pCreateProcessInternalW =
+                hKernelBase ? (LPVOID)GetProcAddress(hKernelBase, "CreateProcessInternalW") : NULL;
+            if (pCreateProcessInternalW)
+                MH_CreateHook(pCreateProcessInternalW, (LPVOID)CreateProcessInternalW_Hook,
+                              (LPVOID *)&g_pCreateProcessInternalWOriginal);
+        }
+
+        /* Enable the hooks (all at once: one thread freeze) */
+        if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
             MH_Uninitialize();
             return FALSE;
         }
@@ -463,7 +579,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         /* Create stop event and start reporter thread */
         g_hStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
         if (!g_hStopEvent) {
-            MH_DisableHook((LPVOID)pNtCreateFile);
+            MH_DisableHook(MH_ALL_HOOKS);
             MH_Uninitialize();
             return FALSE;
         }
@@ -471,7 +587,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         g_hReporterThread = CreateThread(NULL, 0, ReporterThreadProc, NULL, 0, NULL);
         if (!g_hReporterThread) {
             CloseHandle(g_hStopEvent);
-            MH_DisableHook((LPVOID)pNtCreateFile);
+            MH_DisableHook(MH_ALL_HOOKS);
             MH_Uninitialize();
             return FALSE;
         }
