@@ -6,6 +6,13 @@
  * via the FILEMON_FILE environment variable.
  *
  * Usage: filemon_commandline_run OUTPUT_FILE COMMAND [ARGS...]
+ *        filemon_commandline_run --inject PID DLL
+ *
+ * Built as filemon_commandline_run.exe (x64) and filemon_commandline_run32.exe (x86),
+ * next to filemon_hook.dll and filemon_hook32.dll. A process can only be injected
+ * by a launcher of its own bitness (LoadLibraryW's address must be valid in it), so
+ * for the other bitness this runs the other launcher with --inject. The hook DLL
+ * does the same for child processes.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -76,6 +83,66 @@ static BOOL InjectDll(HANDLE hProcess, const wchar_t *dllPath)
     return (waitResult == WAIT_OBJECT_0) && (threadExit != 0);
 }
 
+/* Inject the hook DLL of the target's bitness, directly or through the other launcher */
+static BOOL InjectHook(HANDLE hProcess, DWORD pid, const wchar_t *exeDir)
+{
+    /* on 64-bit Windows, IsWow64Process is TRUE exactly for 32-bit processes */
+    BOOL targetIs32 = FALSE;
+#ifdef _WIN64
+    const BOOL selfIs32 = FALSE;
+#else
+    const BOOL selfIs32 = TRUE;
+#endif
+    wchar_t dll[MAX_PATH], cmd[3 * MAX_PATH];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exitCode = 1;
+
+    if (!IsWow64Process(hProcess, &targetIs32))
+        return FALSE;
+    swprintf_s(dll, MAX_PATH, L"%s%s", exeDir, targetIs32 ? L"filemon_hook32.dll" : L"filemon_hook.dll");
+    if (GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES)
+        return FALSE;
+    if (targetIs32 == selfIs32)
+        return InjectDll(hProcess, dll);
+
+    swprintf_s(cmd, 3 * MAX_PATH, L"\"%s%s\" --inject %lu \"%s\"", exeDir,
+               targetIs32 ? L"filemon_commandline_run32.exe" : L"filemon_commandline_run.exe", pid, dll);
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return FALSE;
+    CloseHandle(pi.hThread);
+    if (WaitForSingleObject(pi.hProcess, 15000) != WAIT_OBJECT_0 ||
+        !GetExitCodeProcess(pi.hProcess, &exitCode))
+        exitCode = 1;
+    CloseHandle(pi.hProcess);
+    return exitCode == 0;
+}
+
+/* --inject PID DLL: inject DLL into a (suspended) process of this launcher's bitness */
+static int InjectMode(int nArgs, LPWSTR *args)
+{
+    DWORD pid;
+    HANDLE hProcess;
+    BOOL ok;
+
+    if (nArgs < 4) {
+        fprintf(stderr, "Usage: filemon_commandline_run --inject PID DLL\n");
+        return 2;
+    }
+    pid = wcstoul(args[2], NULL, 10);
+    hProcess = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+                           PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) {
+        fprintf(stderr, "error: cannot open process %lu (error %lu)\n", pid, GetLastError());
+        return 1;
+    }
+    ok = InjectDll(hProcess, args[3]);
+    CloseHandle(hProcess);
+    return ok ? 0 : 1;
+}
+
 int main(void)
 {
     int nArgs;
@@ -93,6 +160,8 @@ int main(void)
 
     /* Parse command line */
     args = CommandLineToArgvW(GetCommandLineW(), &nArgs);
+    if (args && nArgs >= 2 && wcscmp(args[1], L"--inject") == 0)
+        return InjectMode(nArgs, args);
     if (!args || nArgs < 3) {
         fprintf(stderr, "Usage: filemon_commandline_run OUTPUT_FILE COMMAND [ARGS...]\n");
         return 1;
@@ -146,8 +215,8 @@ int main(void)
         return 1;
     }
 
-    /* Inject hook DLL into the target process */
-    if (!InjectDll(pi.hProcess, dllPath)) {
+    /* Inject the hook DLL of the target's bitness */
+    if (!InjectHook(pi.hProcess, pi.dwProcessId, exeDir)) {
         fprintf(stderr, "error: DLL injection failed (error %lu)\n", GetLastError());
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess);

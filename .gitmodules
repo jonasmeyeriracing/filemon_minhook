@@ -1,3 +1,4 @@
 [submodule "minhook"]
 	path = minhook
-	url = https://github.com/TsudaKageyu/minhook.git
+	url = https://github.com/victorjupin-iracing/minhook.git
+	branch = filemon-nofreeze
